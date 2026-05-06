@@ -2,10 +2,13 @@
 
 Periodically scans for runs stuck in RUNNING state past their pre-computed
 ``timeout_at`` deadline. Before marking as FAILED, attempts to verify the
-actual run status by querying the sandbox's bash command history.
+actual run status by querying the execution environment.
 
 The ``timeout_at`` column is set to ``started_at + max_duration`` when the
 dispatcher transitions a run to RUNNING (see ``mark_run_status``).
+
+The watchdog is mode-agnostic — all mode-specific logic is encapsulated
+in the ExecutionBackend (see automation/backends/).
 """
 
 import asyncio
@@ -16,11 +19,10 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
+from automation.backends import get_backend
 from automation.config import Settings
 from automation.models import AutomationRun, AutomationRunStatus
 from automation.utils import log_extra
-from automation.utils.api_key import get_api_key_for_automation_run
-from automation.utils.sandbox import cleanup_sandbox, verify_run_status
 from automation.utils.time import utcnow
 
 
@@ -30,13 +32,11 @@ logger = logging.getLogger("automation.watchdog")
 async def _verify_and_mark_run(
     session: AsyncSession,
     run: AutomationRun,
-    settings: Settings,
+    settings: Settings,  # noqa: ARG001 - kept for API compatibility
 ) -> bool:
-    """Verify run status via sandbox and mark accordingly.
+    """Verify run status via backend and mark accordingly.
 
-    Attempts to connect to the sandbox and check the last bash command's exit code.
-    If verification succeeds, marks the run based on the actual result.
-    If verification fails (sandbox unavailable), marks as FAILED with timeout error.
+    Mode-agnostic: all verification logic is encapsulated in the backend.
 
     Returns True if the run was marked with a terminal status.
     """
@@ -45,9 +45,15 @@ async def _verify_and_mark_run(
     extra = log_extra(run_id=run_id, sandbox_id=sandbox_id)
     now = utcnow()
 
-    # If no sandbox_id, we can't verify - mark as failed
-    if not sandbox_id:
-        logger.warning("No sandbox_id for stale run, marking FAILED", extra=extra)
+    # Get backend for this run (mode-specific logic encapsulated)
+    backend = get_backend(run)
+
+    # Verify run status via backend
+    try:
+        logger.info("Verifying run status via backend", extra=extra)
+        verification = await backend.verify_run(run_id)
+    except Exception as e:
+        logger.warning("Failed to verify run: %s", e, extra=extra)
         stmt = (
             update(AutomationRun)
             .where(
@@ -57,40 +63,11 @@ async def _verify_and_mark_run(
             .values(
                 status=AutomationRunStatus.FAILED,
                 completed_at=now,
-                error_detail="Timed out: no sandbox_id available for verification",
+                error_detail=f"Timed out: verification failed: {e}",
             )
         )
         result: CursorResult = await session.execute(stmt)  # type: ignore[assignment]
         return result.rowcount > 0
-
-    # Get API key for sandbox access
-    try:
-        api_key = await get_api_key_for_automation_run(run)
-    except Exception as e:
-        logger.warning("Failed to get API key for verification: %s", e, extra=extra)
-        stmt = (
-            update(AutomationRun)
-            .where(
-                AutomationRun.id == run.id,
-                AutomationRun.status == AutomationRunStatus.RUNNING,
-            )
-            .values(
-                status=AutomationRunStatus.FAILED,
-                completed_at=now,
-                error_detail=f"Timed out: could not get API key for verification: {e}",
-            )
-        )
-        result = await session.execute(stmt)  # type: ignore[assignment]
-        return result.rowcount > 0
-
-    # Try to verify via sandbox
-    verification = await verify_run_status(
-        api_url=settings.openhands_api_base_url,
-        api_key=api_key,
-        sandbox_id=sandbox_id,
-        keep_alive=run.keep_alive,
-        run_id=run_id,
-    )
 
     if verification.verified:
         exit_code = verification.exit_code
@@ -169,7 +146,7 @@ async def _verify_and_mark_run(
         result = await session.execute(stmt)  # type: ignore[assignment]
         return result.rowcount > 0
 
-    # Verification failed - sandbox not available or command still running
+    # Verification failed - execution environment not available or command still running
     # This likely means the sandbox crashed or was cleaned up
     logger.warning(
         "Could not verify run status: %s, marking as timed out",
@@ -177,14 +154,13 @@ async def _verify_and_mark_run(
         extra=extra,
     )
 
-    # Clean up sandbox if not keep_alive (best effort, may already be gone)
-    if not run.keep_alive and sandbox_id:
-        await cleanup_sandbox(
-            api_url=settings.openhands_api_base_url,
-            api_key=api_key,
-            sandbox_id=sandbox_id,
-            run_id=run_id,
-        )
+    # Clean up resources via backend (Cloud deletes sandbox, local is no-op)
+    # Skip cleanup if keep_alive is True — user wants to inspect the sandbox
+    if not run.keep_alive:
+        try:
+            await backend.cleanup_after_verification(run_id)
+        except Exception as e:
+            logger.warning("Cleanup after verification failed: %s", e, extra=extra)
 
     error_msg = verification.error or "no completion callback received"
 

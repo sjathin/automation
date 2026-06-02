@@ -24,11 +24,25 @@ WARNING: Changing any value here requires careful analysis of:
 # DO NOT CHANGE: Would break all existing automations and SDK integration.
 WORK_DIR = "/workspace/project"
 
-# Path where tarballs are extracted inside the sandbox. This is:
-# - Written by the sandbox initialization script
-# - Read by the automation entrypoint
-# DO NOT CHANGE: Would break tarball extraction in running sandboxes.
+# Base path where tarballs are staged inside the sandbox before extraction.
+# Each run uses a unique suffix to avoid collisions when multiple automations
+# share the same agent server (local mode).
+# DEPRECATED: Use tarball_path_for_run() for per-run isolation.
 TARBALL_PATH = "/tmp/automation.tar.gz"
+
+
+def tarball_path_for_run(run_id: str | None = None) -> str:
+    """Return a run-isolated tarball path inside the sandbox.
+
+    In local mode, multiple automations share a single agent server. Using a
+    fixed path causes a race: run A uploads its tarball, run B overwrites it,
+    run A extracts B's code. A unique path per run eliminates the collision.
+    """
+    if run_id:
+        return f"/tmp/automation-{run_id}.tar.gz"
+    import uuid
+
+    return f"/tmp/automation-{uuid.uuid4().hex[:12]}.tar.gz"
 
 # model profile names mirror the agent-server profile-store constraints.
 MODEL_PROFILE_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"

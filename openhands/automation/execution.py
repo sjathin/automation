@@ -22,7 +22,7 @@ from tenacity import (
 )
 
 from openhands.automation.config import get_config
-from openhands.automation.constants import TARBALL_PATH
+from openhands.automation.constants import tarball_path_for_run
 from openhands.automation.exceptions import PermanentDispatchError, TarballNotFoundError
 from openhands.automation.utils import log_extra
 from openhands.automation.utils.sandbox import delete_sandbox
@@ -373,14 +373,16 @@ async def execute_in_context(
         return log_extra(run_id=run_id, sandbox_id=sandbox_id)
 
     try:
+        tarball_dest = tarball_path_for_run(run_id)
+
         # Get tarball into environment: upload bytes or download from URL
         if isinstance(tarball_source, bytes):
             logger.info("Uploading tarball", extra=_log_ctx())
-            await _upload(client, agent_url, session_key, tarball_source, TARBALL_PATH)
+            await _upload(client, agent_url, session_key, tarball_source, tarball_dest)
         else:
             logger.info("Downloading tarball from URL", extra=_log_ctx())
             await _download_in_sandbox(
-                client, agent_url, session_key, tarball_source, TARBALL_PATH
+                client, agent_url, session_key, tarball_source, tarball_dest
             )
 
         exports = ""
@@ -390,7 +392,8 @@ async def execute_in_context(
 
         cmd = (
             f"mkdir -p {work_dir}"
-            f" && tar xzf {TARBALL_PATH} -C {work_dir}"
+            f" && tar xzf {tarball_dest} -C {work_dir}"
+            f" && rm -f {tarball_dest}"
             f" && cd {work_dir}"
             f" && {exports}([ ! -f setup.sh ] || bash setup.sh)"
             f" && {entrypoint}"
@@ -510,16 +513,18 @@ async def run_automation(
             env_vars.setdefault("SANDBOX_ID", sandbox_id)
             env_vars.setdefault("SESSION_API_KEY", session_key)
 
+            tarball_dest = tarball_path_for_run(run_id)
+
             # Get tarball into sandbox: upload bytes or download from URL
             if isinstance(tarball_source, bytes):
                 logger.info("Uploading tarball to sandbox", extra=_log_ctx())
                 await _upload(
-                    client, agent_url, session_key, tarball_source, TARBALL_PATH
+                    client, agent_url, session_key, tarball_source, tarball_dest
                 )
             else:
                 logger.info("Downloading tarball in sandbox from URL", extra=_log_ctx())
                 await _download_in_sandbox(
-                    client, agent_url, session_key, tarball_source, TARBALL_PATH
+                    client, agent_url, session_key, tarball_source, tarball_dest
                 )
 
             exports = ""
@@ -529,7 +534,8 @@ async def run_automation(
 
             cmd = (
                 f"mkdir -p {work_dir}"
-                f" && tar xzf {TARBALL_PATH} -C {work_dir}"
+                f" && tar xzf {tarball_dest} -C {work_dir}"
+                f" && rm -f {tarball_dest}"
                 f" && cd {work_dir}"
                 f" && {exports}([ ! -f setup.sh ] || bash setup.sh)"
                 f" && {entrypoint}"
